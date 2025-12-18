@@ -1,276 +1,92 @@
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
-#include "esp_sleep.h"
+#include <bluefruit.h>
 
-// BLE MIDI Service UUID
-#define MIDI_SERVICE_UUID        "03b80e5a-ede8-4b33-a751-6ce34ec4c700"
-#define MIDI_CHARACTERISTIC_UUID "7772e5db-3868-4112-a1a9-f2669d106bf3"
-// #define DEBUG
-
+#define BUTTON_NEXT D0
 #define DEBOUNCE_TIME 50
+#define MAX_IDLE_MS (10UL * 60UL * 1000UL)  // 10 minutes
 
-unsigned long long min_to_us(unsigned long long m)
-{
-  unsigned long long uS_TO_S_FACTOR = 1000000ULL;  /* Conversion factor for micro seconds to seconds */
-  return  60 * uS_TO_S_FACTOR * m;
-}
-const unsigned long long MAX_TIMEOUT = min_to_us(10);
-BLECharacteristic *pCharacteristic;
+BLEHidAdafruit blehid;
+BLEDis bledis;
+const char SEND_CHR = char(39);
+
 bool deviceConnected = false;
+bool lastButtonState = HIGH;
+unsigned long lastActivity = 0;
 
-// Button pins - adjust these to your actual pins
-const int BUTTON_NEXT = D0;  // Change to your button pin
+/* ---------------- Callbacks ---------------- */
 
-// MIDI note numbers (ForScore listens for these)
-const uint8_t MIDI_NOTE_NEXT = 60;  // Middle C for next page
-
-void print(const char *a){
-  #ifdef DEBUG
-  Serial.println(a);
-  #endif
-  return;
-}
-void printInt(long unsigned int a){
-  #ifdef DEBUG
-  Serial.println(a);
-  #endif
-}
-/*
-Method to print the reason by which ESP32
-has been awaken from sleep
-*/
-void print_wakeup_reason(){
-  esp_sleep_wakeup_cause_t wakeup_reason;
-
-  wakeup_reason = esp_sleep_get_wakeup_cause();
-
-  switch(wakeup_reason)
-  {
-    case ESP_SLEEP_WAKEUP_EXT0 : print("Wakeup caused by external signal using RTC_IO"); break;
-    case ESP_SLEEP_WAKEUP_EXT1 : print("Wakeup caused by external signal using RTC_CNTL"); break;
-    case ESP_SLEEP_WAKEUP_TIMER : print("Wakeup caused by timer"); break;
-    case ESP_SLEEP_WAKEUP_TOUCHPAD : print("Wakeup caused by touchpad"); break;
-    case ESP_SLEEP_WAKEUP_ULP : print("Wakeup caused by ULP program"); break;
-    case ESP_SLEEP_WAKEUP_GPIO : print("Wakeup caused by GPIO Interrupt"); break;
-    default : 
-      #ifdef DEBUG 
-      Serial.printf("Wakeup was not caused by deep sleep: %d\n",wakeup_reason); break;
-      #endif
-      return;
-  }
-}
-class ServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-      deviceConnected = true;
-      print("ForScore connected!");
-    };
-
-    void onDisconnect(BLEServer* pServer) {
-      deviceConnected = false;
-      print("ForScore disconnected");
-      delay(500);
-      BLEDevice::startAdvertising();
-      print("Advertising restarted - will auto-reconnect if bonded");
-    }
-};
-
-class SecurityCallbacks : public BLESecurityCallbacks {
-  uint32_t onPassKeyRequest() {
-    print("Passkey requested");
-    return 0; // No passkey needed
-  }
-
-  void onPassKeyNotify(uint32_t pass_key) {
-    Serial.print("Passkey notify: ");
-    printInt(pass_key);
-  }
-
-  bool onConfirmPIN(uint32_t pass_key) {
-    print("PIN confirmed");
-    return true;
-  }
-
-  bool onSecurityRequest() {
-    print("Security request - allowing");
-    return true;
-  }
-
-  void onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) {
-    if (cmpl.success) {
-      print("*** BONDING SUCCESSFUL ***");
-      print("Device will now auto-reconnect!");
-    } else {
-      print("Bonding failed");
-    }
-  }
-};
-
-void sendMIDINoteOn(uint8_t note) {
-  Serial.print("[MIDI] Sending Note ON - Note: ");
-  Serial.print(note);
-  print(" Velocity: 127");
-  
-  uint8_t midiPacket[] = {
-    0x80,  // Header
-    0x80,  // Timestamp high
-    0x90,  // Note On, Channel 1
-    note,  // Note number
-    0x7F   // Velocity (127 = max)
-  };
-  pCharacteristic->setValue(midiPacket, 5);
-  pCharacteristic->notify();
-  print("[MIDI] Packet sent via BLE");
+void connect_callback(uint16_t conn_handle) {
+  deviceConnected = true;
 }
 
-void sendMIDINoteOff(uint8_t note) {
-  Serial.print("[MIDI] Sending Note OFF - Note: ");
-  printInt(note);
-  
-  uint8_t midiPacket[] = {
-    0x80,  // Header
-    0x80,  // Timestamp high
-    0x80,  // Note Off, Channel 1
-    note,  // Note number
-    0x00   // Velocity (0)
-  };
-  pCharacteristic->setValue(midiPacket, 5);
-  pCharacteristic->notify();
-  print("[MIDI] Packet sent via BLE");
+void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
+  deviceConnected = false;
 }
 
-unsigned long last_wake ;
-void setup() {
-  #ifdef DEBUG
-  Serial.begin(115200);
-  delay(1000);
-  #endif
-  last_wake = millis();
-  print("\n=== ForScore Page Turner Starting ===");
-  print_wakeup_reason();
-  // set wakeup
-  // the mask is each pin which should be enabled.
- esp_deep_sleep_enable_gpio_wakeup(1ULL << BUTTON_NEXT ,ESP_GPIO_WAKEUP_GPIO_HIGH);  
-  // Setup buttons with internal pullup
-  pinMode(BUTTON_NEXT, INPUT);
-  
-  print("Button NEXT on pin: ");
-  printInt(BUTTON_NEXT);
-  print("Buttons configured with INPUT_PULLUP");
+/* ---------------- Sleep ---------------- */
 
-  // Initialize BLE
-  print("\n--- Initializing BLE ---");
-  BLEDevice::init("HarpFlip");
-  print("BLE Device initialized");
-
-  // Set up security for bonding
-  BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
-  BLEDevice::setSecurityCallbacks(new SecurityCallbacks());
-  
-  BLESecurity *pSecurity = new BLESecurity();
-  pSecurity->setAuthenticationMode(ESP_LE_AUTH_BOND); // Enable bonding
-  pSecurity->setCapability(ESP_IO_CAP_NONE); // No display, no input
-  pSecurity->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
-  
-  print("Bonding enabled - device will remember connection");
-
-  // Create BLE Server
-  BLEServer *pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new ServerCallbacks());
-  print("BLE Server created");
-
-  // Create BLE Service
-  BLEService *pService = pServer->createService(MIDI_SERVICE_UUID);
-  print("BLE Service created");
-
-  // Create BLE Characteristic
-  pCharacteristic = pService->createCharacteristic(
-    MIDI_CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_READ |
-    BLECharacteristic::PROPERTY_NOTIFY |
-    BLECharacteristic::PROPERTY_WRITE_NR
+void goToSleep() {
+  nrf_gpio_cfg_sense_input(
+    digitalPinToPinName(BUTTON_NEXT),
+    NRF_GPIO_PIN_PULLUP,
+    NRF_GPIO_PIN_SENSE_LOW
   );
 
-  pCharacteristic->addDescriptor(new BLE2902());
-  print("BLE Characteristic created");
-
-  // Start service
-  pService->start();
-  print("BLE Service started");
-
-  // Start advertising
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(MIDI_SERVICE_UUID);
-  pAdvertising->setMinPreferred(0x06);
-  pAdvertising->setMaxPreferred(0x12);
-  pAdvertising->start();
-  print("BLE Advertising started");
-
-  print("\n=== READY ===");
-  print("FIRST TIME SETUP:");
-  print("1. Open ForScore on your iPhone");
-  print("2. Go to Settings > Page Turns > Bluetooth Pedals");
-  print("3. Connect to 'PageTurner'");
-  print("4. Assign MIDI notes in ForScore settings");
-  print("");
-  print("AFTER FIRST CONNECTION:");
-  print("Device is bonded and will auto-reconnect!");
-  print("Just turn on the pedal and ForScore will connect automatically.");
-  print("\nWaiting for connection...");
+  delay(10);
+  sd_power_system_off();
 }
 
-static bool lastNextState = HIGH;
-static unsigned long lastStatusPrint = 0;
+/* ---------------- Setup ---------------- */
 
+void setup() {
+  pinMode(BUTTON_NEXT, INPUT);
+  lastActivity = millis();
+
+  Bluefruit.begin();
+  Bluefruit.setName("HarpFlip");
+  Bluefruit.setTxPower(4);
+
+  Bluefruit.Periph.setConnectCallback(connect_callback);
+  Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
+
+  // HID Keyboard
+  blehid.begin();
+
+  // Optional device info
+  bledis.setManufacturer("DIY");
+  bledis.setModel("BLE Page Turner");
+  bledis.begin();
+
+  // Advertising
+  Bluefruit.Advertising.addService(blehid);
+  Bluefruit.Advertising.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.start(0);
+}
+
+/* ---------------- Loop ---------------- */
 
 void loop() {
-
-  // Print connection status every 5 seconds
-  // if (millis() - lastStatusPrint > 5000) {
-  //   Serial.print("[STATUS] Connected: ");
-  //   print(deviceConnected ? "YES" : "NO");
-  //   if (!deviceConnected) {
-  //     print("[STATUS] Waiting for ForScore to connect...");
-  //   }
-  //   lastStatusPrint = millis();
-  // }
-
-  // Read current button states
-  bool nextState = digitalRead(BUTTON_NEXT);
-  
-  // Debug button states every second
-  // static unsigned long lastButtonDebug = 0;
-  // if (millis() - lastButtonDebug > 1000) {
-  //   Serial.print("[BUTTONS] Next: ");
-  //   Serial.print(nextState == HIGH ? "RELEASED (HIGH)" : "PRESSED (LOW)");
-  //   Serial.print(" | Prev: ");
-  //   print(prevState == HIGH ? "RELEASED (HIGH)" : "PRESSED (LOW)");
-  //   lastButtonDebug = millis();
-  // }
+  bool buttonState = digitalRead(BUTTON_NEXT);
 
   if (deviceConnected) {
-    // Next button - trigger on press (HIGH to LOW transition)
-    if (nextState == LOW && lastNextState == HIGH) {
-      print("\n>>> NEXT PAGE TRIGGERED <<<");
-      sendMIDINoteOn(MIDI_NOTE_NEXT);
-      delay(10);
-      sendMIDINoteOff(MIDI_NOTE_NEXT);
-      print(">>> NEXT PAGE COMPLETE <<<\n");
-    last_wake = millis();
+    // Trigger on press (HIGH → LOW)
+    if (buttonState == LOW && lastButtonState == HIGH) {
+     uint8_t keys[6] = { HID_KEY_ARROW_RIGHT, 0, 0, 0, 0, 0 };
+      blehid.keyboardReport(0, keys);
+      delay(5);
+
+      uint8_t none[6] = { 0, 0, 0, 0, 0, 0 };
+      blehid.keyboardReport(0, none);
+
+      lastActivity = millis();
     }
-    lastNextState = nextState;
-
-  } else {
-    // Update button states even when disconnected to prevent false triggers
-    lastNextState = nextState;
   }
 
-  if (millis() - last_wake > MAX_TIMEOUT)
-  {
-    print("Sleeping!");
-    last_wake = millis();
-    esp_deep_sleep_start();
+  lastButtonState = buttonState;
+
+  if (millis() - lastActivity > MAX_IDLE_MS) {
+    goToSleep();
   }
+
   delay(DEBOUNCE_TIME);
 }
